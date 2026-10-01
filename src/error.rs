@@ -1,4 +1,7 @@
-use diesel::{r2d2::PoolError, result::Error as DieselError};
+use diesel::{
+    r2d2::PoolError,
+    result::{DatabaseErrorKind, Error as DieselError},
+};
 
 use std::{error::Error as StdError, fmt};
 
@@ -6,6 +9,19 @@ use std::{error::Error as StdError, fmt};
 pub enum Error {
     PoolError(PoolError),
     DieselError(DieselError),
+}
+
+impl Error {
+    /// Whether the database rejected a write because it is read-only (e.g. a replica or standby).
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Error::DieselError(DieselError::DatabaseError(
+                DatabaseErrorKind::ReadOnlyTransaction,
+                _
+            ))
+        )
+    }
 }
 
 impl fmt::Display for Error {

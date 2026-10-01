@@ -3,9 +3,12 @@ use crate::Error;
 use casbin::{error::AdapterError, Result};
 use diesel::{
     self,
+    dsl::sql,
     r2d2::{ConnectionManager, PooledConnection},
     result::Error as DieselError,
-    sql_query, BoolExpressionMethods, Connection as DieselConnection, ExpressionMethods, QueryDsl,
+    sql_query,
+    sql_types::Bool,
+    BoolExpressionMethods, Connection as DieselConnection, ExpressionMethods, QueryDsl,
     RunQueryDsl,
 };
 
@@ -23,9 +26,36 @@ pub type Connection = diesel::SqliteConnection;
 
 type Pool = PooledConnection<ConnectionManager<Connection>>;
 
+/// Reports whether the policy table already exists.
+///
+/// This is a read-only query, so it also succeeds on connections that cannot
+/// execute DDL at all — a streaming replica, or an application role
+/// deliberately granted no `CREATE` privilege.
+fn table_exists(conn: &mut Connection) -> Result<bool> {
+    #[cfg(feature = "postgres")]
+    let check = format!("to_regclass('{TABLE_NAME}') IS NOT NULL");
+    #[cfg(feature = "mysql")]
+    let check = format!(
+        "EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name = '{TABLE_NAME}')"
+    );
+    #[cfg(feature = "sqlite")]
+    let check = format!(
+        "EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{TABLE_NAME}')"
+    );
+
+    diesel::select(sql::<Bool>(&check))
+        .get_result(conn)
+        .map_err(|err| AdapterError(Box::new(Error::DieselError(err))).into())
+}
+
 #[cfg(feature = "postgres")]
 pub fn new(conn: Result<Pool>) -> Result<usize> {
     conn.and_then(|mut conn| {
+        if table_exists(&mut conn)? {
+            return Ok(0);
+        }
+
         sql_query(format!(
             r#"
                 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -49,6 +79,10 @@ pub fn new(conn: Result<Pool>) -> Result<usize> {
 #[cfg(feature = "mysql")]
 pub fn new(conn: Result<Pool>) -> Result<usize> {
     conn.and_then(|mut conn| {
+        if table_exists(&mut conn)? {
+            return Ok(0);
+        }
+
         sql_query(format!(
             r#"
                 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -73,6 +107,10 @@ pub fn new(conn: Result<Pool>) -> Result<usize> {
 #[cfg(feature = "sqlite")]
 pub fn new(conn: Result<Pool>) -> Result<usize> {
     conn.and_then(|mut conn| {
+        if table_exists(&mut conn)? {
+            return Ok(0);
+        }
+
         sql_query(format!(
             r#"
                 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -129,8 +167,8 @@ pub fn remove_policies(mut conn: Pool, pt: &str, rules: Vec<Vec<String>>) -> Res
                 .and(v4.eq(&rule[4]))
                 .and(v5.eq(&rule[5]));
 
-            match diesel::delete(casbin_rule.filter(filter)).execute(conn) {
-                Ok(1) => continue,
+            match diesel::delete(casbin_rule.filter(filter)).execute(conn)? {
+                1 => continue,
                 _ => return Err(DieselError::RollbackTransaction),
             }
         }
@@ -229,21 +267,17 @@ pub(crate) fn save_policy(mut conn: Pool, rules: Vec<NewCasbinRule>) -> Result<(
     use schema::casbin_rule::dsl::casbin_rule;
 
     conn.transaction::<_, DieselError, _>(|conn| {
-        if diesel::delete(casbin_rule).execute(conn).is_err() {
-            return Err(DieselError::RollbackTransaction);
-        }
+        diesel::delete(casbin_rule).execute(conn)?;
 
-        diesel::insert_into(casbin_rule)
+        let inserted = diesel::insert_into(casbin_rule)
             .values(&rules)
-            .execute(conn)
-            .and_then(|n| {
-                if n == rules.len() {
-                    Ok(())
-                } else {
-                    Err(DieselError::RollbackTransaction)
-                }
-            })
-            .map_err(|_| DieselError::RollbackTransaction)
+            .execute(conn)?;
+
+        if inserted == rules.len() {
+            Ok(())
+        } else {
+            Err(DieselError::RollbackTransaction)
+        }
     })
     .map_err(|err| AdapterError(Box::new(Error::DieselError(err))).into())
 }
@@ -270,17 +304,15 @@ pub(crate) fn add_policies(mut conn: Pool, new_rules: Vec<NewCasbinRule>) -> Res
     use schema::casbin_rule::dsl::casbin_rule;
 
     conn.transaction::<_, DieselError, _>(|conn| {
-        diesel::insert_into(casbin_rule)
+        let inserted = diesel::insert_into(casbin_rule)
             .values(&new_rules)
-            .execute(&mut *conn)
-            .and_then(|n| {
-                if n == new_rules.len() {
-                    Ok(true)
-                } else {
-                    Err(DieselError::RollbackTransaction)
-                }
-            })
-            .map_err(|_| DieselError::RollbackTransaction)
+            .execute(&mut *conn)?;
+
+        if inserted == new_rules.len() {
+            Ok(true)
+        } else {
+            Err(DieselError::RollbackTransaction)
+        }
     })
     .map_err(|err| AdapterError(Box::new(Error::DieselError(err))).into())
 }
